@@ -12,10 +12,15 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from urllib.parse import urljoin, urlparse
+import json
+from pathlib import Path
 
 
 # 🔴 COLE SUA CONNECTION STRING AQUI (substitua a linha abaixo)
 CONNECTION_STRING = "postgresql://postgres.wnhqaiogzvvwrxcgfwsj:abkm@aws-1-sa-east-1.pooler.supabase.com:5432/postgres"
+
+CHECKPOINT_ARQ = Path("vagas_empregos.jsonl")
+
 
 class EmpregosComBrScraper:
     def __init__(self, headless=False):
@@ -288,32 +293,20 @@ class EmpregosComBrScraper:
             print(f"  ⚠️ Erro ao processar vaga da listagem: {e}")
             return None
 
-    def processar_data(self, texto_data: str) -> str:
-    
+    def processar_data(self, texto_data: str):
         base = datetime.now().date()
         t = (texto_data or "").strip().lower()
 
-
-        # 1) Casos do "hoje" (ou bem recente como horas/minutos)
-        if re.search(r"\b(hoje|today|agora|minutos?|horas?)\b", t): 
-            return base.strftime("%d/%m/%Y")
-
-
-
-        # 2) Ontem
+        if re.search(r"\b(hoje|today|agora|minutos?|horas?)\b", t):
+            return base
         if re.search(r"\b(ontem|yesterday)\b", t):
-            return (base - timedelta(days=1)).strftime("%d/%m/%Y")
+            return base - timedelta(days=1)
 
-        # 3) "Publicada há X dias"
-        m = (
-            re.search(r"h[aá]\s*(\d+)\s*dias?", t)   # ...há 3 dias
-        )
+        m = re.search(r"h[aá]\s*(\d+)\s*dias?", t)
         if m:
-            dias = int(m.group(1))
-            return (base - timedelta(days=dias)).strftime("%d/%m/%Y")
+            return base - timedelta(days=int(m.group(1)))
 
-        # 5) Fallback: se nada casar, devolve hoje
-        return base.strftime("%d/%m/%Y")
+        return base  # fallback
 
     
     def acessar_detalhes_vaga(self, url_vaga):
@@ -545,6 +538,24 @@ class EmpregosComBrScraper:
         
         return "Não informado"
     
+
+    @staticmethod
+    def reset_checkpoint_jsonl(path=CHECKPOINT_ARQ):
+        """Apaga o conteúdo do JSONL no início da execução"""
+        with path.open("w", encoding="utf-8") as f:
+            f.write("")  # limpa o arquivo    
+
+
+    @staticmethod
+    def salvar_checkpoint_jsonl(vaga, path=CHECKPOINT_ARQ):
+        def default_converter(obj):
+            if isinstance(obj, (datetime, date)):
+                return obj.isoformat()  # "2025-09-21"
+            raise TypeError(f"Type {type(obj)} not serializable")
+
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(vaga, ensure_ascii=False, default=default_converter) + "\n")
+    
     def coletar_vagas(self, url, max_paginas=3):
         """Coleta vagas do site empregos.com.br"""
         todas_vagas = []
@@ -571,7 +582,8 @@ class EmpregosComBrScraper:
                 )
                 
                 print(f"📋 Encontradas {len(vagas_elements)} vagas na página {pagina}")
-                
+
+
                 # Processa cada vaga da página
                 for i, vaga_elem in enumerate(vagas_elements, 1):
                     try:
@@ -608,7 +620,9 @@ class EmpregosComBrScraper:
 
                             todas_vagas.append(vaga_completa)
                             print(f"  ✅ Vaga coletada: {vaga_completa['titulo_vaga']} - {vaga_completa['empresa']}")
-                            
+                            self.salvar_checkpoint_jsonl(vaga_completa)
+                            print(f"  ✅ Vaga salva no JSON")
+
                             # Delay entre vagas
                             time.sleep(random.uniform(1, 3))
                             
@@ -647,72 +661,229 @@ class EmpregosComBrScraper:
         
         return todas_vagas
     
-    def salvar_vagas_supabase(self, conn, vagas):
-        """Salva as vagas coletadas no Supabase"""
-        if not vagas:
-            print("⚠️  Nenhuma vaga para salvar")
-            return
+    @staticmethod
+    def get_conn():
+        return psycopg2.connect(
+            CONNECTION_STRING,
+            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5,
+            options='-c statement_timeout=60000'  # 60s por comando
+        )
+    
+    @staticmethod
+    def _coerce_date(value):
+        if not value or value == "Não informado":
+            return None
+        if isinstance(value, date):
+            return value
+        if isinstance(value, str):
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+                try:
+                    return datetime.strptime(value, fmt).date()
+                except:
+                    pass
+        return None
+    
+    # def salvar_vagas_supabase(self, conn, vagas):
+    #     """Salva as vagas coletadas no Supabase"""
+    #     if not vagas:
+    #         print("⚠️  Nenhuma vaga para salvar")
+    #         return
         
-        try:
-            cursor = conn.cursor()
+    #     try:
+    #         cursor = conn.cursor()
             
-            # SQL para inserir ignorando duplicatas
-            sql_insert = """
+    #         # SQL para inserir ignorando duplicatas
+    #         sql_insert = """
+    #         INSERT INTO vagas_emprego (
+    #             titulo_vaga, empresa, localizacao, salario, descricao, 
+    #             requisitos, beneficios, tipo_contrato, modalidade, 
+    #             data_publicacao, url_vaga, fonte
+    #         ) VALUES (
+    #             %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+    #         ) ON CONFLICT (url_vaga) DO NOTHING;
+    #         """
+            
+    #         vagas_salvas = 0
+    #         vagas_duplicadas = 0
+            
+    #         print(f"\n💾 Salvando {len(vagas)} vagas no banco...")
+            
+    #         for i, vaga in enumerate(vagas, 1):
+    #             try:
+    #                 cursor.execute(sql_insert, (
+    #                     vaga['titulo_vaga'],
+    #                     vaga['empresa'],
+    #                     vaga['localizacao'],
+    #                     vaga['salario'],
+    #                     vaga['descricao'][:5000],  # Limita descrição
+    #                     vaga['requisitos'][:2000],  # Limita requisitos
+    #                     vaga['beneficios'][:1000],  # Limita benefícios
+    #                     vaga['tipo_contrato'],
+    #                     vaga['modalidade'],
+    #                     vaga['data_publicacao'],
+    #                     vaga['url_vaga'],
+    #                     vaga['fonte']
+    #                 ))
+                    
+    #                 if cursor.rowcount > 0:
+    #                     vagas_salvas += 1
+    #                     print(f"  ✅ ({i}/{len(vagas)}) Salva: {vaga['titulo_vaga'][:50]}")
+    #                 else:
+    #                     vagas_duplicadas += 1
+    #                     print(f"  🔄 ({i}/{len(vagas)}) Duplicada: {vaga['titulo_vaga'][:50]}")
+                        
+    #             except Exception as e:
+    #                 print(f"  ❌ ({i}/{len(vagas)}) Erro: {e}")
+    #                 conn.rollback()
+    #                 continue
+            
+    #         conn.commit()
+    #         cursor.close()
+            
+    #         print(f"\n✅ RESULTADO DO SALVAMENTO:")
+    #         print(f"   📊 Vagas novas: {vagas_salvas}")
+    #         print(f"   🔄 Duplicadas: {vagas_duplicadas}")
+    #         print(f"   📈 Total processadas: {len(vagas)}")
+            
+    #     except Exception as e:
+    #         print(f"❌ Erro ao salvar no banco: {e}")
+    #         conn.rollback()
+
+    def salvar_vagas_supabase(self, vagas, batch_size=200, max_retries=5):
+        """
+        Insere vagas em lotes com retry e reconexão automática.
+        Usa ON CONFLICT (url_vaga) DO NOTHING para ignorar duplicadas.
+        """
+        if not vagas:
+            print("⚠️ Nenhuma vaga para salvar")
+            return
+
+        sql_insert = """
             INSERT INTO vagas_emprego (
                 titulo_vaga, empresa, localizacao, salario, descricao, 
                 requisitos, beneficios, tipo_contrato, modalidade, 
                 data_publicacao, url_vaga, fonte
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            ) ON CONFLICT (url_vaga) DO NOTHING;
-            """
-            
-            vagas_salvas = 0
-            vagas_duplicadas = 0
-            
-            print(f"\n💾 Salvando {len(vagas)} vagas no banco...")
-            
-            for i, vaga in enumerate(vagas, 1):
-                try:
-                    cursor.execute(sql_insert, (
-                        vaga['titulo_vaga'],
-                        vaga['empresa'],
-                        vaga['localizacao'],
-                        vaga['salario'],
-                        vaga['descricao'][:5000],  # Limita descrição
-                        vaga['requisitos'][:2000],  # Limita requisitos
-                        vaga['beneficios'][:1000],  # Limita benefícios
-                        vaga['tipo_contrato'],
-                        vaga['modalidade'],
-                        vaga['data_publicacao'],
-                        vaga['url_vaga'],
-                        vaga['fonte']
-                    ))
-                    
-                    if cursor.rowcount > 0:
-                        vagas_salvas += 1
-                        print(f"  ✅ ({i}/{len(vagas)}) Salva: {vaga['titulo_vaga'][:50]}")
-                    else:
-                        vagas_duplicadas += 1
-                        print(f"  🔄 ({i}/{len(vagas)}) Duplicada: {vaga['titulo_vaga'][:50]}")
-                        
-                except Exception as e:
-                    print(f"  ❌ ({i}/{len(vagas)}) Erro: {e}")
-                    conn.rollback()
-                    continue
-            
-            conn.commit()
-            cursor.close()
-            
-            print(f"\n✅ RESULTADO DO SALVAMENTO:")
-            print(f"   📊 Vagas novas: {vagas_salvas}")
-            print(f"   🔄 Duplicadas: {vagas_duplicadas}")
-            print(f"   📈 Total processadas: {len(vagas)}")
-            
-        except Exception as e:
-            print(f"❌ Erro ao salvar no banco: {e}")
-            conn.rollback()
-    
+            )
+            ON CONFLICT (url_vaga) DO NOTHING;
+        """
+
+        total = len(vagas)
+        vagas_salvas = 0
+        vagas_duplicadas = 0
+
+        # conecta uma vez aqui; se cair, reconecta no retry
+        conn = self.get_conn()
+        cursor = conn.cursor()
+
+        i = 0
+        try:
+            while i < total:
+                lote = vagas[i:i + batch_size]
+                tentativas = 0
+
+                while True:
+                    try:
+                        for vaga in lote:
+                            cursor.execute(sql_insert, (
+                                vaga.get('titulo_vaga') or "",
+                                vaga.get('empresa') or "",
+                                vaga.get('localizacao') or "",
+                                vaga.get('salario') or "",
+                                (vaga.get('descricao') or "")[:5000],
+                                (vaga.get('requisitos') or "")[:2000],
+                                (vaga.get('beneficios') or "")[:1000],
+                                vaga.get('tipo_contrato') or "Não informado",
+                                vaga.get('modalidade') or "Não informado",
+                                self._coerce_date(vaga.get('data_publicacao')),
+                                vaga.get('url_vaga') or "",
+                                vaga.get('fonte') or "Empregos.com.br"
+                            ))
+                            # psycopg2: rowcount = 1 quando inseriu; 0 quando DO NOTHING
+                            if cursor.rowcount == 1:
+                                vagas_salvas += 1
+                            else:
+                                vagas_duplicadas += 1
+
+                        conn.commit()
+                        print(f"  ✅ Lote {i+1}-{i+len(lote)} salvo")
+                        break  # saiu do while True deste lote
+
+                    except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                        # conexão caiu → retry com reconexão
+                        tentativas += 1
+                        if tentativas > max_retries:
+                            print(f"❌ Falha ao salvar lote após {max_retries} tentativas: {e}")
+                            raise
+                        print(f"⚠️ Conexão perdida. Tentando reconectar (tentativa {tentativas}/{max_retries})…")
+                        # fecha e reconecta
+                        try:
+                            try:
+                                cursor.close()
+                            except:
+                                pass
+                            try:
+                                conn.close()
+                            except:
+                                pass
+                            time.sleep(2 * tentativas)  # backoff exponencial simples
+                            conn = self.get_conn()
+                            cursor = conn.cursor()
+                        except Exception as e2:
+                            print("❌ Erro ao reconectar:", e2)
+                            time.sleep(2 * tentativas)
+                            continue
+
+                    except Exception as e:
+                        # erro de dados → rollback do lote e tenta item a item
+                        print(f"  ❌ Erro no lote {i+1}-{i+len(lote)}: {e}")
+                        conn.rollback()
+                        for vaga in lote:
+                            try:
+                                cursor.execute(sql_insert, (
+                                    vaga.get('titulo_vaga') or "",
+                                    vaga.get('empresa') or "",
+                                    vaga.get('localizacao') or "",
+                                    vaga.get('salario') or "",
+                                    (vaga.get('descricao') or "")[:5000],
+                                    (vaga.get('requisitos') or "")[:2000],
+                                    (vaga.get('beneficios') or "")[:1000],
+                                    vaga.get('tipo_contrato') or "Não informado",
+                                    vaga.get('modalidade') or "Não informado",
+                                    self._coerce_date(vaga.get('data_publicacao')),
+                                    vaga.get('url_vaga') or "",
+                                    vaga.get('fonte') or "Empregos.com.br"
+                                ))
+                                conn.commit()
+                                if cursor.rowcount == 1:
+                                    vagas_salvas += 1
+                                else:
+                                    vagas_duplicadas += 1
+                            except Exception as e1:
+                                conn.rollback()
+                                # Loga a problemática e segue
+                                print("    ⚠️ Falha nesta vaga (pulando):", vaga.get('url_vaga'), e1)
+                        break  # saiu do while True deste lote
+
+                i += len(lote)
+
+        finally:
+            try:
+                cursor.close()
+            except:
+                pass
+            try:
+                conn.close()
+            except:
+                pass
+
+        print(f"\n✅ RESULTADO DO SALVAMENTO:")
+        print(f"   📊 Vagas novas: {vagas_salvas}")
+        print(f"   🔄 Duplicadas: {vagas_duplicadas}")
+        print(f"   📈 Total processadas: {total}")
+
+        
     def verificar_estatisticas(self, conn):
         """Verifica estatísticas do banco"""
         try:
@@ -750,6 +921,8 @@ class EmpregosComBrScraper:
         """Executa o scraping usando keywords específicas"""
         print("🚀 INICIANDO SCRAPING EMPREGOS.COM.BR COM KEYWORDS")
         print("=" * 60)
+        
+        self.reset_checkpoint_jsonl()
         
         # Lista completa de keywords
         todas_keywords = [
@@ -850,7 +1023,7 @@ class EmpregosComBrScraper:
                 
                 # Salva no banco
                 print("\n💾 Salvando vagas no banco de dados...")
-                self.salvar_vagas_supabase(conn, todas_vagas_coletadas)
+                self.salvar_vagas_supabase(todas_vagas_coletadas)
                 
                 # Mostra estatísticas finais
                 self.verificar_estatisticas(conn)

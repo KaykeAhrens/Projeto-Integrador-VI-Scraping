@@ -11,15 +11,20 @@ from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import WebDriverException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+import undetected_chromedriver as uc
+
 from urllib.parse import urljoin, urlparse
 import json
 from pathlib import Path
+from groq import Groq
+from urllib.parse import urlsplit, urlunsplit, urljoin, quote, unquote, urlparse
 
-
-# 🔴 COLE SUA CONNECTION STRING AQUI (substitua a linha abaixo)
 CONNECTION_STRING = "postgresql://postgres.wnhqaiogzvvwrxcgfwsj:abkm@aws-1-sa-east-1.pooler.supabase.com:5432/postgres"
 
-CHECKPOINT_ARQ = Path("vagas_empregos.jsonl")
+CHECKPOINT_ARQ = Path("vagas_empregos2.jsonl")
 
 
 class EmpregosComBrScraper:
@@ -30,31 +35,37 @@ class EmpregosComBrScraper:
         self.setup_driver(headless)
         
     def setup_driver(self, headless=False):
-        """Configura o driver do Chrome"""
-        chrome_options = Options()
+        """Configura o driver com undetected-chromedriver, usando apenas as opções necessárias."""
         
-        # Configurações para evitar detecção
+        chrome_options = uc.ChromeOptions()
+        
+        # Apenas as opções essenciais. As opções experimentais foram removidas.
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
         chrome_options.add_argument("--disable-dev-shm-usage")
         chrome_options.add_argument("--no-sandbox")
         
         # User agent realista
-        chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+        chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
         
         if headless:
+            print("⚠️ Executando em modo headless. Se ocorrerem erros, tente em modo visual (headless=False).")
             chrome_options.add_argument('--headless=new')
         
         chrome_options.add_argument('--window-size=1920,1080')
         chrome_options.add_argument('--start-maximized')
         
         try:
-            self.driver = webdriver.Chrome(options=chrome_options)
-            self.wait = WebDriverWait(self.driver, 15)
-            print("✅ Driver Chrome configurado com sucesso!")
+            print("🚀 Usando undetected-chromedriver com opções limpas...")
+            # A chamada para criar o driver continua a mesma
+            self.driver = uc.Chrome(options=chrome_options, use_subprocess=True)
+            
+            # Aumentamos a paciência do scraper, já que o site é lento
+            self.wait = WebDriverWait(self.driver, 25) 
+            print("✅ Driver undetected-chromedriver configurado com sucesso!")
+
         except Exception as e:
             print(f"❌ Erro ao configurar driver: {e}")
+            print("💡 Dica: Certifique-se de que a biblioteca 'undetected-chromedriver' está instalada (`pip install undetected-chromedriver`).")
             raise
     
     def conectar_banco(self):
@@ -217,81 +228,166 @@ class EmpregosComBrScraper:
         
         return "Não informado"
     
+    BASE = "https://www.empregos.com.br"
 
+    def _normalize_url(self, u: str) -> str | None:
+        if not u:
+            return None
+        u = u.strip()
 
-    
+        # ignora anchors e javascript:
+        if u.startswith("#") or u.lower().startswith("javascript:"):
+            return None
+
+        # torna absoluta
+        if u.startswith("/"):
+            u = urljoin(self.BASE, u)
+        elif not urlparse(u).scheme:
+            u = urljoin(self.BASE + "/", u)
+
+        # codifica corretamente path e query (acentos, espaços etc.)
+        sp = urlsplit(u)
+        path = quote(unquote(sp.path))                  # /vaga/Desenvolvedor ... -> /vaga/Desenvolvedor%20...
+        query = quote(unquote(sp.query), safe="=&?/%:+")# mantém separadores
+        frag = quote(unquote(sp.fragment), safe="=&?/%:+")
+        return urlunsplit((sp.scheme, sp.netloc, path, query, frag))
+
     def processar_vaga_listagem(self, vaga_element):
-        """Processa uma vaga da listagem"""
+        """Processa uma vaga da listagem (extraindo URL sem depender de clique real)."""
         try:
             vaga_info = {}
-            
-            # Título da vaga
+
+            # Título
             try:
                 titulo_elem = vaga_element.find_element(By.XPATH, ".//span[contains(@class, 'text-base') and contains(@class, 'text-cinza90')]")
                 vaga_info['titulo_vaga'] = titulo_elem.text
-
-                #print("Titulo adquirido.")
-                
             except:
                 vaga_info['titulo_vaga'] = "Não informado"
-                print("Erro ao adquirir o titulo. ")
+                print("Erro ao adquirir o titulo.")
 
-        
-            # Link da Vaga 
-            try:
-                link_elem = vaga_element.find_element(By.XPATH, ".//span[text()='Mais detalhes']")
-                link_elem.click()
-
-                # Espera até abrir uma nova aba (timeout de 10s)
-                WebDriverWait(self.driver, 10).until(lambda d: len(d.window_handles) > 1)
-
-                abas = self.driver.window_handles
-                self.driver.switch_to.window(abas[1])
-                link_pagina = self.driver.current_url
-                print("URL da vaga:", link_pagina)
-                vaga_info['url_vaga'] = link_pagina
-
-                self.driver.close()
-                self.driver.switch_to.window(abas[0])
-            except Exception as e:
-                vaga_info['url_vaga'] = None
-                print("Erro ao adquirir o link:", e)
-            
             # Empresa
             try:
                 empresa_elem = vaga_element.find_element(By.XPATH, "( .//a[contains(@class,'text-ciano100') and contains(@class,'text-sm')] )[2]")
                 vaga_info['empresa'] = empresa_elem.text
-
-                #print("empresa adquirida.")
             except:
                 vaga_info['empresa'] = "Não informado"
-                print("Erro ao adquirir a empresa. ")
-            
+                print("Erro ao adquirir a empresa.")
+
             # Localização
             try:
-                local_elem = vaga_element.find_element(By.XPATH, "(.//p[@title])[1]")
+                local_elem = vaga_element.find_element(By.XPATH, "(.//h3[@title])[1]")
                 titulo = local_elem.get_attribute("title") or local_elem.text
                 vaga_info['localizacao'] = titulo
-                #print("localização adquirida")
             except:
                 vaga_info['localizacao'] = "Não informado"
-                print("Erro ao adquirir a localização. ")
-            
-            # Data de publicação
+                print("Erro ao adquirir a localização.")
+
+            # Data
             try:
                 data_elem = vaga_element.find_element(By.XPATH, ".//h3[starts-with(text(), 'Publicada ')]")
-                data_texto = data_elem.text
-                vaga_info['data_publicacao'] = self.processar_data(data_texto)
-
+                vaga_info['data_publicacao'] = self.processar_data(data_elem.text)
             except:
                 vaga_info['data_publicacao'] = datetime.now().date()
-                print("Erro ao adquirir a data. ")
-            
+                print("Erro ao adquirir a data.")
+
+            # ===== URL real da vaga (sem clicar) =====
+            try:
+                # 1) Tenta achar um <a href="/vaga/...">
+                url_vaga = self.driver.execute_script("""
+                    const card = arguments[0];
+                    // 1) link direto
+                    let a = card.querySelector('a[href*="/vaga/"]');
+                    if (a && a.href) return a.href;
+
+                    // 2) atributos data-href no botão, no card, ou pais
+                    const btn = card.querySelector('span,button,[role="button"]');
+                    const probe = el => el && (el.getAttribute('data-href') || el.dataset?.href || el.getAttribute('data-url') || el.dataset?.url);
+                    let dh = probe(btn) || probe(card) || probe(card.parentElement);
+                    if (dh) {
+                        try { return new URL(dh, location.origin).href; } catch(e) { /* tenta bruto */ return dh; }
+                    }
+
+                    // 3) onclick com URL
+                    const attrs = [btn, card, card.parentElement].filter(Boolean);
+                    for (const el of attrs) {
+                        const oc = el.getAttribute && (el.getAttribute('onclick') || '');
+                        if (oc) {
+                            // procura "http(s)://.../vaga/...."
+                            const m = oc.match(/https?:\\/\\/[^'"]*\\/vaga\\/[^'"]+/);
+                            if (m) return m[0];
+                            // ou '/vaga/...' relativo
+                            const m2 = oc.match(/['"]?(\\/vaga\\/[^'"]+)['"]?/);
+                            if (m2) { try { return new URL(m2[1], location.origin).href; } catch(e) { return m2[1]; } }
+                        }
+                    }
+
+                    // 4) Às vezes o card tem um ID com número da vaga; se houver,
+                    //    mas sem slug, NÃO retornamos aqui (pois você disse que precisa do slug).
+                    //    Então apenas null e deixamos o fallback do hook rodar abaixo no Python.
+                    return null;
+                """, vaga_element)
+
+                # 4) Fallback: hookar window.open, clicar e capturar a URL sem abrir popup real
+                if not url_vaga:
+                    try:
+                        link_elem = vaga_element.find_element(By.XPATH, ".//span[normalize-space()='Mais detalhes']")
+                    except:
+                        link_elem = None
+
+                    if link_elem:
+                        # injeta hook no window.open (não abre popup, só capta a URL)
+                        self.driver.execute_script("""
+                            window._capturedOpen = null;
+                            (function(){
+                                const _open = window.open;
+                                window.open = function(u,n,s){
+                                    try { window._capturedOpen = u; } catch(e) {}
+                                    return null; // impede popup
+                                };
+                            })();
+                        """)
+                        # rola e clica
+                        self.scroll_para_elemento(link_elem)
+                        self.clicar_com_javascript(link_elem)
+                        time.sleep(0.8)
+                        # lê URL capturada
+                        url_vaga = self.driver.execute_script("return window._capturedOpen;")
+
+                if url_vaga and '/vaga/' in (url_vaga or ''):
+                    url_vaga = self._normalize_url(url_vaga)
+                    vaga_info['url_vaga'] = url_vaga
+                    print("URL da vaga:", url_vaga)
+                else:
+                    vaga_info['url_vaga'] = None
+                    print("⚠️ Não consegui extrair a URL da vaga sem href/slug.")
+
+            except Exception as e:
+                vaga_info['url_vaga'] = None
+                print("Erro ao extrair URL da vaga:", e)
+
             return vaga_info
-            
+
         except Exception as e:
             print(f"  ⚠️ Erro ao processar vaga da listagem: {e}")
             return None
+
+    # def limpar_abas_extras(self):
+    #     """Fecha todas as abas extras, mantendo apenas a principal"""
+    #     try:
+    #         abas = self.driver.window_handles
+    #         if len(abas) > 1:
+    #             aba_principal = abas[0]
+    #             for aba in abas[1:]:
+    #                 try:
+    #                     self.driver.switch_to.window(aba)
+    #                     self.driver.close()
+    #                 except:
+    #                     pass
+    #             self.driver.switch_to.window(aba_principal)
+    #             print("  🧹 Abas extras limpas")
+    #     except Exception as e:
+    #         print(f"  ⚠️ Erro ao limpar abas: {e}")
+
 
     def processar_data(self, texto_data: str):
         base = datetime.now().date()
@@ -308,91 +404,111 @@ class EmpregosComBrScraper:
 
         return base  # fallback
 
-    
-    def acessar_detalhes_vaga(self, url_vaga):
-        """Acessa a página de detalhes de uma vaga"""
-        try:
-            print(f"  🔍 Acessando: {url_vaga}")
-            
-            # Abre a vaga em uma nova aba
-            self.driver.execute_script("window.open('');")
-            self.driver.switch_to.window(self.driver.window_handles[-1])
-            
-            self.driver.get(url_vaga)
-            time.sleep(random.uniform(2, 4))
-            
-            detalhes = {}
-            
-            # Aguarda a página carregar
-            self.aguardar_elemento((By.TAG_NAME, "body"), timeout=10)
-            
-            # Pega todo o texto da página
-            try:
-                descricao_texto = self.driver.find_element(By.XPATH, ".//div[contains(@class, 'text-cinza90') and contains(@class, 'break-words')]").text
-                detalhes['descricao'] = self.limpar_texto(descricao_texto)[:5000]  # Limita a 5000 caracteres
-            except:
-                detalhes['descricao'] = "Não informado"
-                print("Erro ao extrair descrição")
 
+    def _esperar_carregamento_detalhes(self, expected_title=None, timeout=25):
+        """
+        Espera de forma robusta pelo carregamento da página de detalhes.
+        1. Aguarda o CONTAINER DA DESCRIÇÃO aparecer. É a melhor prova de que a vaga carregou.
+        2. Valida o TÍTULO como uma checagem secundária.
+        """
+        try:
+            # 1. PONTO CRÍTICO: Esperar pelo container da descrição.
+            descricao_locator = (By.XPATH, ".//div[contains(@class, 'text-cinza90') and contains(@class, 'break-words')]")
+            print("  ⏳ Aguardando container da descrição...")
+            WebDriverWait(self.driver, timeout).until(
+                EC.presence_of_element_located(descricao_locator)
+            )
+            print("  ✅ Container da descrição carregado.")
+
+            # 2. CHECAGEM SECUNDÁRIA: Validar o título para ter 100% de certeza.
+            if expected_title:
+                titulo_locator = (By.XPATH, "//h1[contains(@class,'text-') or contains(@class,'font-')][1]")
+                titulo_atual = self.driver.find_element(*titulo_locator).text.strip()
+
+                t_esperado = re.sub(r'\s+', ' ', expected_title.lower())
+                t_atual = re.sub(r'\s+', ' ', titulo_atual.lower())
+                
+                palavras_esperadas = set(t_esperado.split())
+                palavras_atuais = set(t_atual.split())
+                
+                if not palavras_esperadas.intersection(palavras_atuais):
+                    print(f"  ⚠️ Título não corresponde! Esperado: '{expected_title}', Encontrado: '{titulo_atual}'")
+                    raise TimeoutException("Título não correspondeu após carregamento do conteúdo.")
             
-            # Extrai informações do texto completo
-            texto_completo = detalhes['descricao']
-            
-            # Modalidade
-            try:
-                modalidade = self.driver.find_element(By.XPATH, ".//p[normalize-space(text())='Tipo de vaga']/following-sibling::h3").text
-                detalhes['modalidade'] = self.extrair_modalidade(modalidade)
-            except:
-                detalhes['modalidade'] = "Não informado"
-                print("Erro ao extrair modalidade")
-            
-            # Salário
-            try:
-                salario = self.driver.find_element(By.XPATH, ".//p[normalize-space(text())='Remuneração']/following-sibling::h3").text
-                detalhes['salario'] = self.extrair_salario(salario)
-            except:
-                detalhes['salario'] = "Não informado"
-                print("Erro ao extrair salario")
-            
-            # Requisitos
-            try:
-                detalhes['requisitos'] = self.extrair_requisitos(texto_completo)
-            except:
-                detalhes['requisitos'] = "Não informado"
-                print("Erro ao extrair requisitos")
-            
-            # Benefícios
-            try:
-                detalhes['beneficios'] = self.extrair_beneficios(texto_completo)
-            except:
-                detalhes['beneficios'] = "Não informado"
-                print("Erro ao extrair beneficios")
-            
-            # Tipo de contrato
-            try:
-                detalhes['tipo_contrato'] = self.extrair_tipo_contrato(texto_completo)
-            except:
-                detalhes['tipo_contrato'] = "Não informado"
-                print("Erro ao extrair tipo de contrato")
-            
-            # Fecha a aba e volta para a principal
-            self.driver.close()
-            self.driver.switch_to.window(self.driver.window_handles[0])
-            
-            return detalhes
-            
-        except Exception as e:
-            print(f"  ❌ Erro ao acessar detalhes: {e}")
-            
-            # Tenta voltar para a aba principal
-            try:
-                if len(self.driver.window_handles) > 1:
-                    self.driver.close()
-                self.driver.switch_to.window(self.driver.window_handles[0])
-            except:
-                pass
-            
+            print(f"  ✅ Título validado: '{titulo_atual}'")
+            return True
+
+        except TimeoutException:
+            print("  ❌ Timeout: Conteúdo principal da vaga não carregou a tempo.")
+            return False
+    
+    def acessar_detalhes_vaga(self, url_vaga, max_tentativas=3, expected_title=None):
+        """Versão super robusta para sites lentos e com proteção."""
+        url_vaga = self._normalize_url(url_vaga)
+        if not url_vaga:
+            print("  ⚠️ URL inválida após normalização; pulando...")
             return {}
+        
+        for tentativa in range(max_tentativas):
+            try:
+                print(f"  🔍 Acessando: {url_vaga} (tentativa {tentativa + 1}/{max_tentativas})")
+                
+                # Damos mais tempo para a página carregar, pois sabemos que é lenta
+                self.driver.set_page_load_timeout(45)
+                try:
+                    self.driver.get(url_vaga)
+                except TimeoutException:
+                    print("  ⚠️ Timeout de carregamento inicial (normal para este site). Validando conteúdo...")
+                    try:
+                        self.driver.execute_script("window.stop();")
+                    except WebDriverException:
+                        pass
+
+                # 🔴 USA A NOVA VALIDAÇÃO ROBUSTA 🔴
+                if not self._esperar_carregamento_detalhes(expected_title):
+                    if tentativa < max_tentativas - 1:
+                        print("  🔄 Falha na validação. Tentando atualizar a página...")
+                        self.driver.refresh()
+                        time.sleep(3)
+                        continue
+                    else:
+                        print("  ❌ Desistindo da vaga após múltiplas falhas de validação.")
+                        return {}
+
+                # --- EXTRAÇÃO SEGURA ---
+                # Se chegamos aqui, a página carregou corretamente.
+                detalhes = {}
+                
+                # Usamos o mesmo seletor da validação para garantir consistência
+                descricao_elem = self.driver.find_element(By.XPATH, ".//div[contains(@class, 'text-cinza90') and contains(@class, 'break-words')]")
+                detalhes['descricao'] = self.limpar_texto(descricao_elem.text)
+                
+                texto_completo = detalhes.get('descricao', '')
+
+                # Outros campos
+                try:
+                    modalidade = self.driver.find_element(By.XPATH, ".//p[normalize-space(text())='Tipo de vaga']/following-sibling::h3").text
+                    detalhes['modalidade'] = self.extrair_modalidade(modalidade)
+                except: detalhes['modalidade'] = "Não informado"
+                
+                try:
+                    salario = self.driver.find_element(By.XPATH, ".//p[normalize-space(text())='Remuneração']/following-sibling::h3").text
+                    detalhes['salario'] = self.extrair_salario(salario)
+                except: detalhes['salario'] = "Não informado"
+                
+                detalhes['requisitos'] = self.extrair_requisitos(texto_completo)
+                detalhes['beneficios'] = self.extrair_beneficios(texto_completo)
+                detalhes['tipo_contrato'] = self.extrair_tipo_contrato(texto_completo)
+
+                return detalhes
+
+            except Exception as e:
+                print(f"  ❌ Erro inesperado na tentativa {tentativa + 1}: {type(e).__name__} - {e}")
+                if tentativa < max_tentativas - 1:
+                    time.sleep(3)
+                    continue
+                return {}
+        return {}
         
 
     
@@ -555,109 +671,200 @@ class EmpregosComBrScraper:
 
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(vaga, ensure_ascii=False, default=default_converter) + "\n")
-    
+
+    def _groq_is_ti(self, vaga: dict, model: str = "llama-3.3-70b-versatile", max_retries: int = 3) -> bool:
+        """
+        Retorna True se a vaga for de TI (Tecnologia da Informação), senão False.
+        Usa título, descrição e campos auxiliares.
+        """
+        try:
+            api_key = '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'
+            if not api_key:
+                print("⚠️ GROQ_API_KEY não configurada; usando fallback heurístico.")
+                return self._heuristica_is_ti(vaga)
+
+            client = Groq(api_key=api_key)
+
+            system = (
+                "Você é um classificador de vagas. "
+                "Responda ESTRITAMENTE em JSON válido com o formato: {\"is_ti\": true|false}. "
+                "Considere TI como desenvolvimento de software, dados/ML, DevOps/Cloud, QA, "
+                "segurança, suporte/infra, redes, DBA, análise de sistemas, produto/UX de software. "
+                "Não é TI: vagas administrativas/financeiras/comerciais, saúde, jurídico, RH (a menos que seja específico de TI), "
+                "industrial/operacional não ligado a software/infra, professores de áreas não-TI, etc. "
+                "Se não houver informação suficiente, responda {\"is_ti\": false}."
+            )
+
+            # Passamos só o essencial
+            payload = {
+                "titulo_vaga": vaga.get("titulo_vaga"),
+                "descricao": vaga.get("descricao"),
+                "empresa": vaga.get("empresa"),
+                "localizacao": vaga.get("localizacao"),
+                "tipo_contrato": vaga.get("tipo_contrato"),
+                "modalidade": vaga.get("modalidade")
+            }
+
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": f"Classifique a vaga abaixo:\n{json.dumps(payload, ensure_ascii=False)}"}
+            ]
+
+            for attempt in range(1, max_retries + 1):
+                try:
+                    resp = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        temperature=0,
+                        response_format={"type": "json_object"},
+                    )
+                    content = resp.choices[0].message.content or "{}"
+                    data = json.loads(content)
+                    return bool(data.get("is_ti", False))
+                except Exception as e:
+                    print(f"⚠️ Groq erro (tentativa {attempt}/{max_retries}): {e}")
+                    time.sleep(1.2 * attempt)
+
+            # Se todas as tentativas falharem, caímos no fallback
+            return self._heuristica_is_ti(vaga)
+
+        except Exception as e:
+            print("⚠️ Falha inesperada no classificador Groq:", e)
+            return self._heuristica_is_ti(vaga)
+
+    def _heuristica_is_ti(self, vaga: dict) -> bool:
+        """
+        Fallback ultra simples (local) caso Groq falhe ou não esteja configurado.
+        """
+        txt = " ".join([
+            vaga.get("titulo_vaga") or "",
+            vaga.get("descricao") or "",
+            vaga.get("requisitos") or "",
+            vaga.get("beneficios") or ""
+        ]).lower()
+
+        # Palavras-chave básicas de TI
+        chaves = [
+            "desenvolvedor", "programador", "software", "sistemas", "ti", "tecnologia da informação",
+            "python", "java", "javascript", "react", "angular", "node", "php", "c#", "c++",
+            "devops", "cloud", "aws", "azure", "gcp", "kubernetes", "docker",
+            "dados", "data", "sql", "postgres", "mysql", "mongodb", "etl", "engenheiro de dados",
+            "cientista de dados", "analista de dados", "machine learning", "ml", "ia", "inteligência artificial",
+            "qa", "teste de software", "quality assurance", "segurança da informação", "redes", "infraestrutura",
+            "dbA", "analista de sistemas", "product owner", "scrum master"
+        ]
+        return any(k in txt for k in chaves)     
+        
     def coletar_vagas(self, url, max_paginas=3):
-        """Coleta vagas do site empregos.com.br"""
+        """
+        Versão Final Corrigida: Implementa a navegação humana e a paginação robusta via verificação de URL.
+        """
         todas_vagas = []
         
         try:
-            print(f"\n🌐 Acessando: {url}")
+            print(f"\n🌐 Acessando página de listagem inicial: {url}")
             self.driver.get(url)
             time.sleep(random.uniform(3, 5))
-            
-            # Aceita cookies se necessário
+
             try:
-                cookie_btn = self.driver.find_element(By.XPATH, "//button[contains(text(), 'Aceitar') or contains(text(), 'OK')]")
-                cookie_btn.click()
-                time.sleep(1)
+                self.driver.find_element(By.XPATH, "//button[contains(text(), 'Aceitar')]").click()
+                print("🍪 Cookies aceitos.")
+                time.sleep(random.uniform(1, 2))
             except:
-                pass
-            
-            for pagina in range(1, max_paginas + 1):
-                print(f"\n📄 Processando página {pagina}...")
-                
-                # Aguarda as vagas carregarem
-                vagas_elements = self.wait.until(
-                    EC.presence_of_all_elements_located((By.XPATH, "//div[contains(@id, 'job-card')]" ))
-                )
-                
-                print(f"📋 Encontradas {len(vagas_elements)} vagas na página {pagina}")
+                print("ℹ️ Banner de cookies não encontrado.")
 
+            for pagina_atual in range(1, max_paginas + 1):
+                print("=" * 60)
+                print(f"📄 Processando a página de resultados Nº {pagina_atual}...")
+                
+                # Armazena a URL da página de listagem atual para voltar depois
+                url_da_lista = self.driver.current_url
 
-                # Processa cada vaga da página
-                for i, vaga_elem in enumerate(vagas_elements, 1):
+                WebDriverWait(self.driver, 30).until(EC.presence_of_all_elements_located((By.XPATH, "//div[contains(@id, 'job-card')]")))
+                time.sleep(random.uniform(2, 4))
+
+                cards = self.driver.find_elements(By.XPATH, "//div[contains(@id, 'job-card')]")
+                num_vagas_na_pagina = len(cards)
+                print(f"📋 Encontradas {num_vagas_na_pagina} vagas. Iniciando o processo de clique e volta...")
+
+                # Usamos um loop de índice para não nos perdermos após voltar a página
+                for i in range(num_vagas_na_pagina):
+                    print("-" * 30)
+                    print(f"  ➡️ Processando vaga {i + 1} de {num_vagas_na_pagina}...")
+                    
+                    vaga_info_basica = {}
+                    
                     try:
-                        print(f"  📝 Processando vaga {i}/{len(vagas_elements)}")
+                        # 1. REENCONTRA OS CARDS A CADA ITERAÇÃO! Essencial para evitar erros.
+                        cards_atuais = self.driver.find_elements(By.XPATH, "//div[contains(@id, 'job-card')]")
+                        if i >= len(cards_atuais):
+                            print("  ⚠️ Card não encontrado, possivelmente um anúncio. Pulando.")
+                            continue
                         
-                        # Scroll até a vaga
-                        self.scroll_para_elemento(vaga_elem)
-                        
-                        # Extrai informações básicas da listagem
-                        vaga_info = self.processar_vaga_listagem(vaga_elem)
-                        
-                        if vaga_info and vaga_info.get('url_vaga'):
-                            # Acessa detalhes da vaga
-                            detalhes = self.acessar_detalhes_vaga(vaga_info['url_vaga'])
-                            
-                            # Monta o objeto da vaga
-                            vaga_completa = {
-                                'titulo_vaga': vaga_info.get('titulo_vaga', 'Não informado'),
-                                'empresa': vaga_info.get('empresa', 'Não informado'),
-                                'localizacao': vaga_info.get('localizacao', 'Não informado'),
-                                'salario': detalhes.get('salario', 'Não informado'),
-                                'descricao': detalhes.get('descricao', vaga_info.get('descricao_breve', 'Não informado')),
-                                'requisitos': detalhes.get('requisitos', 'Não informado'),
-                                'beneficios': detalhes.get('beneficios', 'Não informado'),
-                                'tipo_contrato': detalhes.get('tipo_contrato', 'Não informado'),
-                                'modalidade': detalhes.get('modalidade', 'Não informado'),
-                                'data_publicacao': vaga_info.get('data_publicacao', 'Não informado'),
-                                'url_vaga': vaga_info.get('url_vaga', 'Não informado'),
-                                'fonte': 'Empregos.com.br'
-                            }
-                            
-                            # for campo in vaga_completa:
-                            #     print(f"{campo}: {vaga_completa[campo]}")
+                        card_para_clicar = cards_atuais[i]
+                        self.scroll_para_elemento(card_para_clicar)
+                        time.sleep(0.5)
 
-                            todas_vagas.append(vaga_completa)
-                            print(f"  ✅ Vaga coletada: {vaga_completa['titulo_vaga']} - {vaga_completa['empresa']}")
-                            self.salvar_checkpoint_jsonl(vaga_completa)
-                            print(f"  ✅ Vaga salva no JSON")
+                        # 2. Extrai as infos básicas e a URL ANTES de clicar
+                        titulo_elem = card_para_clicar.find_element(By.XPATH, ".//span[contains(@class, 'text-base')]")
+                        vaga_info_basica['titulo_vaga'] = self.limpar_texto(titulo_elem.text)
+                        vaga_info_basica['url_vaga'] = self._normalize_url(titulo_elem.find_element(By.XPATH, "./ancestor::a").get_attribute('href'))
+                        
+                        # Extrai o resto das infos básicas
+                        try: vaga_info_basica['empresa'] = self.limpar_texto(card_para_clicar.find_element(By.XPATH, "( .//a[contains(@class,'text-ciano100')] )[2]").text)
+                        except: vaga_info_basica['empresa'] = "Não informado"
+                        try: vaga_info_basica['localizacao'] = self.limpar_texto(card_para_clicar.find_element(By.XPATH, "(.//h3[@title])[1]").get_attribute("title"))
+                        except: vaga_info_basica['localizacao'] = "Não informado"
+                        
+                        # 3. CLICA para ir aos detalhes
+                        print(f"  🖱️ Clicando em: {vaga_info_basica['titulo_vaga']}")
+                        self.clicar_com_javascript(titulo_elem)
 
-                            # Delay entre vagas
-                            time.sleep(random.uniform(1, 3))
-                            
+                        # 4. EXTRAI os detalhes da nova página
+                        detalhes = self._extrair_informacoes_da_pagina_detalhes()
+                        if not detalhes:
+                            raise Exception("Falha ao extrair detalhes da vaga.")
+                        
+                        # 5. JUNTA TUDO
+                        vaga_completa = {**vaga_info_basica, **detalhes, 'fonte': 'Empregos.com.br'}
+                        
+                        # 6. FILTRA E SALVA
+                        if not self._heuristica_is_ti(vaga_completa):
+                            print("  ⚠️ Vaga provavelmente não é de TI (heurística). Salvando para verificação posterior.")
+                        
+                        todas_vagas.append(vaga_completa)
+                        self.salvar_checkpoint_jsonl(vaga_completa)
+                        print(f"  💾 Vaga bruta '{vaga_completa['titulo_vaga']}' salva no JSON.")
+                        
                     except Exception as e:
-                        print(f"  ⚠️ Erro ao processar vaga {i}: {e}")
-                        continue
-                
-                # Tenta ir para próxima página
-                if pagina < max_paginas:
+                        print(f"  ❌ Erro ao processar a vaga {i + 1}: {e}")
+                    
+                    finally:
+                        # 7. VOLTA para a URL da lista (mais seguro que driver.back())
+                        print(f"  ↩️ Retornando para a lista: {url_da_lista}")
+                        self.driver.get(url_da_lista)
+                        WebDriverWait(self.driver, 30).until(EC.presence_of_all_elements_located((By.XPATH, "//div[contains(@id, 'job-card')]")))
+                        time.sleep(random.uniform(2, 4)) # Pausa importante
+
+                # Fim do loop de vagas, agora vamos para a próxima página de resultados
+                if pagina_atual < max_paginas:
+                    print("-" * 30)
+                    print(f"  ▶️ Tentando ir para a página de resultados {pagina_atual + 1}...")
                     try:
-                        numero_proxima = str(pagina + 1)
-                        next_btn = self.driver.find_element(
-                            By.XPATH,
-                            f"//a[normalize-space(text())='{numero_proxima}']"
-                        )
-
-                        self.scroll_para_elemento(next_btn)
-                        time.sleep(1)
-
-                        if next_btn.is_enabled():
-                            self.clicar_com_javascript(next_btn)
-                            time.sleep(random.uniform(3, 5))
-                        else:
-                            print("  ⚠️ Não há mais páginas disponíveis")
-                            break
-                            
-                    except NoSuchElementException:
-                        print("  ⚠️ Botão de próxima página não encontrado")
-                        break
-                    except Exception as e:
-                        print(f"  ⚠️ Erro ao navegar para próxima página: {e}")
-                        break
+                        proxima_pagina_btn = self.driver.find_element(By.XPATH, "//a[contains(text(), 'Próxima')]")
+                        self.clicar_com_javascript(proxima_pagina_btn)
+                        
+                        # 🔴 NOVA VERIFICAÇÃO ROBUSTA 🔴
+                        nova_url_esperada = f"/{pagina_atual + 1}"
+                        WebDriverWait(self.driver, 30).until(EC.url_contains(nova_url_esperada))
+                        print(f"  ✅ Paginação bem-sucedida! URL agora contém '{nova_url_esperada}'.")
+                        
+                    except (NoSuchElementException, TimeoutException):
+                        print("  ⏹️ Botão 'Próxima' não encontrado ou a página não carregou. Provavelmente é a última página.")
+                        break # Encerra o loop de páginas para esta keyword
             
         except Exception as e:
-            print(f"❌ Erro geral na coleta: {e}")
+            print(f"❌ Erro fatal na coleta: {e}")
         
         return todas_vagas
     
@@ -927,7 +1134,7 @@ class EmpregosComBrScraper:
         # Lista completa de keywords
         todas_keywords = [
             # Programação Geral
-            "programador", "desenvolvedor", "TI", "tecnologia", "it", "IT", "ti", 
+            "desenvolvedor", "TI", "tecnologia", "it", "IT", "ti", 
             "tecnologia da informação", "sistemas", "engenheiro de software", 
             "dados", "inteligência de dados", "data",
             

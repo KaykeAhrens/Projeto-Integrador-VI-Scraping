@@ -1335,7 +1335,7 @@ def main():
     llm_critical_stop = False
 
     for term in search_terms:
-        if llm_critical_stop:  # ← ADICIONAR
+        if llm_critical_stop: 
             break
         print(f"\n==============================")
         print(f"🔎 Buscando termo: {term}")
@@ -1455,19 +1455,18 @@ def main():
 
             print(f"\nResumo ({term}): coletados={picked}, erros={errors}, pulados_keywords={skipped_keywords}")
 
-            if llm_critical_stop:  # ← NOVA LINHA
-                break              # ← NOVA LINHA
+            if llm_critical_stop:  
+                break             
 
         finally:
             sj.close()
 
-        if llm_critical_stop:  # ← NOVA LINHA
-            break              # ← NOVA LINHA
+        if llm_critical_stop:  
+            break              
 
         # pausa curtinha entre termos pra ser educado com o site
         time.sleep(1.5)
 
-    # ← ADICIONAR ESTAS LINHAS AQUI (mesmo nível de indentação do for)
     if llm_critical_stop:
         print("\n🛑 SCRAPER INTERROMPIDO: LLM obrigatório falhou")
         if not args.dry_run:
